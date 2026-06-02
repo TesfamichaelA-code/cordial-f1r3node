@@ -1,9 +1,11 @@
 pub mod approval;
 pub mod cordiality;
 pub mod dissemination;
+pub mod evidence;
 pub mod finality;
 pub mod fork_choice;
 pub mod ordering;
+pub mod pruning;
 pub mod round;
 pub mod validation;
 pub mod wave;
@@ -20,6 +22,10 @@ pub use dissemination::{
     required_acknowledgements, select_predecessors, select_predecessors_sorted,
     validator_visible_tips, weighted_required_acknowledgements,
 };
+pub use evidence::{
+    CordialEquivocationEvidence, CordialEvidencePool, EquivocationEvidence, EvidenceBlock,
+    EvidencePool, InMemoryEvidencePool,
+};
 pub use finality::{
     final_leader_for_wave, is_final_leader, is_weighted_final_leader, latest_final_leader,
     latest_weighted_final_leader, leader_block_for_wave, weighted_final_leader_for_wave,
@@ -28,6 +34,10 @@ pub use fork_choice::{ForkChoice, collect_validator_tips, fork_choice, is_cordia
 pub use ordering::{
     OrderingCache, OrderingError, approved_blocks_for_leader, previous_final_leader, tau,
     tau_with_cache, weighted_previous_final_leader, weighted_tau, weighted_tau_with_cache, xsort,
+};
+pub use pruning::{
+    CheckpointGc, PruneError, PruneReport, checkpoint_after_finality,
+    checkpoint_after_weighted_finality,
 };
 pub use round::{
     blocks_at_depth, compute_all_depths, depth, depth_prefix, depth_suffix, is_round_cordial,
