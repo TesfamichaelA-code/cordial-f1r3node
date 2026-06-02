@@ -6,12 +6,14 @@ edition.workspace = true
 
 [dependencies]
 cordial-miners-core = { path = "../cordial-miners-core" }
+cordial-f1r3space-adapter = { path = "../cordial-f1r3space-adapter" }
 
 # Shared deps we use internally for translation, hashing, etc.
 sha2.workspace = true
 serde.workspace = true
 bincode.workspace = true
 anyhow.workspace = true
+prost.workspace = true
 
 # Phase 3.4 — crypto alignment with f1r3node.
 blake2.workspace = true
@@ -27,3 +29,13 @@ clap = { version = "4.6", features = ["derive"] }
 
 casper = { path = "../../../f1r3node/casper" }
 models = { path = "../../../f1r3node/models" }
+
+# ── logging ───────────────────────────────────────────────────────────────
+tracing      = "0.1"
+
+# ── error handling ────────────────────────────────────────────────────────
+thiserror    = "1"
+
+[dev-dependencies]
+tempfile  = "3"
+heed      = "0.20"
