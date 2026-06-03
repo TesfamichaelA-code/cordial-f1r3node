@@ -1,2 +1,4 @@
 /target
+node_modules/
+docker/.env
 docs/cordial-miners/generated/
