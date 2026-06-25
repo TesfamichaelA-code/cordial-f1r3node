@@ -61,8 +61,8 @@ use std::collections::{HashMap, HashSet};
 
 use cordial_miners_core::blocklace::Blocklace;
 use cordial_miners_core::consensus::{
-    collect_validator_tips, compute_all_depths, fork_choice, last_round_of_wave,
-    latest_weighted_final_leader, wave_of_round, weighted_tau,
+    OrderingCache, collect_validator_tips, compute_all_depths, fork_choice, last_round_of_wave,
+    latest_weighted_final_leader, wave_of_round, weighted_tau_with_cache, xsort,
 };
 use cordial_miners_core::execution::{CordialBlockPayload, compute_deploys_in_scope};
 use cordial_miners_core::types::{BlockIdentity, NodeId};
@@ -387,16 +387,39 @@ pub(crate) fn ordered_finalized_block_hashes(
     blocklace: &Blocklace,
     bonds: &HashMap<NodeId, u64>,
 ) -> Vec<Vec<u8>> {
+    ordered_finalized_block_hashes_with_cache(blocklace, bonds, &mut OrderingCache::default())
+}
+
+pub(crate) fn ordered_finalized_block_hashes_with_cache(
+    blocklace: &Blocklace,
+    bonds: &HashMap<NodeId, u64>,
+    cache: &mut OrderingCache,
+) -> Vec<Vec<u8>> {
     let leaders = ordered_validators(bonds);
 
     if leaders.is_empty() {
         return Vec::new();
     }
 
-    weighted_tau(blocklace, ES_WAVELENGTH, bonds, |wave| {
-        let idx = usize::try_from(wave).ok()? % leaders.len();
-        Some(leaders[idx].clone())
-    })
+    if leaders.len() == 1
+        && blocklace.checkpoint().is_none()
+        && let Some(ordered) =
+            single_validator_ordered_finalized_block_hashes(blocklace, &leaders[0], ES_WAVELENGTH)
+    {
+        return ordered;
+    }
+
+    weighted_tau_with_cache(
+        blocklace,
+        ES_WAVELENGTH,
+        bonds,
+        0,
+        |wave| {
+            let idx = usize::try_from(wave).ok()? % leaders.len();
+            Some(leaders[idx].clone())
+        },
+        cache,
+    )
     .map(|ordered| {
         ordered
             .into_iter()
@@ -410,6 +433,49 @@ fn ordered_validators(bonds: &HashMap<NodeId, u64>) -> Vec<NodeId> {
     let mut validators: Vec<NodeId> = bonds.keys().cloned().collect();
     validators.sort();
     validators
+}
+
+fn single_validator_ordered_finalized_block_hashes(
+    blocklace: &Blocklace,
+    validator: &NodeId,
+    wavelength: u64,
+) -> Option<Vec<Vec<u8>>> {
+    let depths = compute_all_depths(blocklace);
+    if has_same_round_fork(&depths, validator) {
+        return None;
+    }
+
+    let leader = latest_single_validator_finalized_block_id(blocklace, validator, wavelength)?;
+    let observed_blocks = blocklace
+        .observe(&leader)
+        .into_iter()
+        .filter_map(|id| blocklace.get(&id))
+        .collect();
+
+    xsort(&observed_blocks).ok().map(|ordered| {
+        ordered
+            .into_iter()
+            .map(|id| id.content_hash.to_vec())
+            .collect()
+    })
+}
+
+fn has_same_round_fork(depths: &HashMap<BlockIdentity, u64>, validator: &NodeId) -> bool {
+    let mut rounds = HashMap::new();
+
+    for (id, round) in depths {
+        if &id.creator != validator {
+            continue;
+        }
+
+        let count = rounds.entry(*round).or_insert(0usize);
+        *count += 1;
+        if *count > 1 {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn latest_single_validator_finalized_block_id(
