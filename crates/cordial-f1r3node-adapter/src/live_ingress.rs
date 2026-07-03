@@ -39,9 +39,10 @@ use cordial_miners_core::types::{BlockContent, NodeId};
 use crate::block_translation::BlockMessage;
 use crate::grpc_ingest::{BlocklaceAdapter, GrpcBlockMapper};
 use crate::shard_conf::CasperShardConf;
+use crate::ordered_output::OrderedFinalizedOutput;
 use crate::snapshot::{
     CasperSnapshot, SnapshotError, build_snapshot, latest_finalized_block_id,
-    ordered_finalized_block_hashes_with_cache,
+    ordered_finalized_block_hashes_with_cache, ordered_finalized_output,
 };
 
 /// High-level runtime phase for the live ingress adapter.
@@ -393,6 +394,20 @@ impl<A> LiveIngress<A> {
         Ok(ordered_finalized_block_hashes_with_cache(
             blocklace, bonds, cache,
         ))
+    }
+
+    /// Return the latest finalized ordered fragment from live mirrored state.
+    ///
+    /// This is a read-only seam that exposes the weighted tau ordering over
+    /// the current blocklace mirror. The returned [`OrderedFinalizedOutput`]
+    /// contains the deterministic topological order (predecessor-first) of all
+    /// finalized blocks, the anchoring weighted final leader, consensus
+    /// metadata, and a wall-clock timestamp.
+    ///
+    /// Monotonicity guarantee: each subsequent call produces a prefix of the
+    /// next — blocks are never removed or reordered.
+    pub fn latest_ordered_output(&self) -> OrderedFinalizedOutput {
+        ordered_finalized_output(self.mirror.blocklace(), &self.bonds)
     }
 
     /// Ingest a trusted block that was reconstructed from a live node-facing
