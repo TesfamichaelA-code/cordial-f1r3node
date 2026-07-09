@@ -56,6 +56,23 @@
 //! f1r3node-style `block_hash` that mixes the creator into the hash, so
 //! distinct validators always produce distinct block hashes even over
 //! equal content.
+//!
+//! ## Single-validator fork awareness is shared across seams
+//!
+//! [`latest_finalized_block_id`] (used by `build_snapshot` for
+//! `CasperSnapshot::last_finalized_block`) and
+//! [`ordered_block_identities_with_cache`] (used by
+//! [`ordered_finalized_output`] and [`ordered_finalized_block_hashes_with_cache`])
+//! both resolve the single-validator leader/fork question through the same
+//! [`single_validator_leader`] helper. This guarantees they can never
+//! disagree about whether a single bonded validator has equivocated: if
+//! [`single_validator_leader`] reports a fork, both `last_finalized_block`
+//! and `OrderedFinalizedOutput::anchor` come back empty/`None` for the same
+//! blocklace state. Each caller still independently decides how much extra
+//! work to do beyond that shared decision — `latest_finalized_block_id`
+//! never computes a full `weighted_tau` ordering since it only needs the
+//! anchor, while `ordered_block_identities_with_cache` additionally computes
+//! ordered blocks.
 
 use std::collections::{HashMap, HashSet};
 
@@ -68,6 +85,7 @@ use cordial_miners_core::execution::{CordialBlockPayload, compute_deploys_in_sco
 use cordial_miners_core::types::{BlockIdentity, NodeId};
 
 use crate::block_translation::{BlockMessage, Justification, TranslationError, block_to_message};
+use crate::ordered_output::OrderedFinalizedOutput;
 
 const ES_WAVELENGTH: u64 = 3;
 
@@ -360,6 +378,11 @@ fn dag_lfb(id: &Option<BlockIdentity>) -> Vec<u8> {
 /// Resolve the latest weighted final leader using the current ES defaults:
 /// wavelength 3 and deterministic round-robin leader election over the
 /// bonded validators in lexicographic `NodeId` order.
+///
+/// Shares [`single_validator_leader`] with [`ordered_block_identities_with_cache`]
+/// for the single-validator case, so this function and
+/// [`ordered_finalized_output`]'s `anchor` field can never disagree about
+/// whether a lone bonded validator has equivocated.
 pub(crate) fn latest_finalized_block_id(
     blocklace: &Blocklace,
     bonds: &HashMap<NodeId, u64>,
@@ -370,11 +393,16 @@ pub(crate) fn latest_finalized_block_id(
         return None;
     }
 
-    if leaders.len() == 1
-        && let Some(id) =
-            latest_single_validator_finalized_block_id(blocklace, &leaders[0], ES_WAVELENGTH)
-    {
-        return Some(id);
+    if leaders.len() == 1 && blocklace.checkpoint().is_none() {
+        match single_validator_leader(blocklace, &leaders[0]) {
+            SingleValidatorLeader::Fork => return None,
+            SingleValidatorLeader::Found(leader) => return Some(leader),
+            SingleValidatorLeader::Incomplete => {
+                // No complete wave yet for this validator — fall through to
+                // the weighted-leader lookup, which can still detect
+                // finality via self-ratification.
+            }
+        }
     }
 
     latest_weighted_final_leader(blocklace, ES_WAVELENGTH, bonds, |wave| {
@@ -390,43 +418,111 @@ pub(crate) fn ordered_finalized_block_hashes(
     ordered_finalized_block_hashes_with_cache(blocklace, bonds, &mut OrderingCache::default())
 }
 
+/// Unified dispatch: ordered finalized block identities and anchor in one pass.
+///
+/// Shares the "empty leaders → single-validator → multi-validator
+/// weighted_tau" dispatch between the hash and [`OrderedFinalizedOutput`]
+/// callers so the branch structure lives in one place.
+///
+/// ## Single-validator fallthrough
+///
+/// For a single bonded validator we first try the fast single-validator
+/// path ([`single_validator_output`]). That path can come back empty for
+/// two very different reasons, which must not be conflated:
+///
+/// - **Equivocation** (same-round fork): the validator signed two blocks in
+///   the same round. This is adversarial. We must never fall through to the
+///   `weighted_tau` path in this case, because that path has no fork
+///   awareness and could report an anchor/blocks derived from the
+///   equivocating validator's frontier anyway — silently reintroducing the
+///   exact anchor/blocks inconsistency this dispatch exists to prevent.
+/// - **Incomplete wave**: normal and expected — happens every round until
+///   enough blocks accumulate. Safe, and even desirable, to fall through to
+///   `weighted_tau`, which can detect finality via self-ratification even
+///   with less than one full wave of blocks.
+///
+/// So the fork check is performed explicitly and short-circuits before any
+/// fallthrough decision is made; only "no complete wave yet" falls through.
+fn ordered_block_identities_with_cache(
+    blocklace: &Blocklace,
+    bonds: &HashMap<NodeId, u64>,
+    cache: &mut OrderingCache,
+) -> (Vec<BlockIdentity>, Option<BlockIdentity>) {
+    let leaders = ordered_validators(bonds);
+
+    if leaders.is_empty() {
+        return (Vec::new(), None);
+    }
+
+    if leaders.len() == 1 && blocklace.checkpoint().is_none() {
+        match single_validator_leader(blocklace, &leaders[0]) {
+            SingleValidatorLeader::Fork => {
+                // Equivocation: this is a terminal answer, never fall
+                // through. Trusting weighted_tau here would let an
+                // equivocating validator's frontier drive the
+                // ordering/anchor.
+                return (Vec::new(), None);
+            }
+            SingleValidatorLeader::Found(leader) => {
+                let observed = blocklace
+                    .observe(&leader)
+                    .into_iter()
+                    .filter_map(|id| blocklace.get(&id))
+                    .collect();
+                let blocks = xsort(&observed).unwrap_or_default();
+                return (blocks, Some(leader));
+            }
+            SingleValidatorLeader::Incomplete => {
+                // No complete wave yet for this validator — genuinely fall
+                // through to the weighted_tau path below, which can still
+                // detect finality via self-ratification.
+            }
+        }
+    }
+
+    let leader_of_wave = |wave: u64| -> Option<NodeId> {
+        let idx = usize::try_from(wave).ok()? % leaders.len();
+        Some(leaders[idx].clone())
+    };
+
+    let anchor = latest_weighted_final_leader(blocklace, ES_WAVELENGTH, bonds, leader_of_wave);
+
+    let blocks = weighted_tau_with_cache(blocklace, ES_WAVELENGTH, bonds, 0, leader_of_wave, cache)
+        .unwrap_or_default();
+
+    (blocks, anchor)
+}
+
 pub(crate) fn ordered_finalized_block_hashes_with_cache(
     blocklace: &Blocklace,
     bonds: &HashMap<NodeId, u64>,
     cache: &mut OrderingCache,
 ) -> Vec<Vec<u8>> {
-    let leaders = ordered_validators(bonds);
+    let (blocks, _anchor) = ordered_block_identities_with_cache(blocklace, bonds, cache);
+    blocks
+        .into_iter()
+        .map(|id| id.content_hash.to_vec())
+        .collect()
+}
 
-    if leaders.is_empty() {
-        return Vec::new();
-    }
+/// Build an [`OrderedFinalizedOutput`] from the current blocklace state.
+///
+/// This is the read-only adapter seam that returns the latest finalized
+/// ordered fragment from live mirrored state.
+pub(crate) fn ordered_finalized_output(
+    blocklace: &Blocklace,
+    bonds: &HashMap<NodeId, u64>,
+) -> OrderedFinalizedOutput {
+    let (blocks, anchor) =
+        ordered_block_identities_with_cache(blocklace, bonds, &mut OrderingCache::default());
 
-    if leaders.len() == 1
-        && blocklace.checkpoint().is_none()
-        && let Some(ordered) =
-            single_validator_ordered_finalized_block_hashes(blocklace, &leaders[0], ES_WAVELENGTH)
-    {
-        return ordered;
-    }
-
-    weighted_tau_with_cache(
-        blocklace,
+    OrderedFinalizedOutput::new(
+        blocks,
+        anchor,
         ES_WAVELENGTH,
-        bonds,
-        0,
-        |wave| {
-            let idx = usize::try_from(wave).ok()? % leaders.len();
-            Some(leaders[idx].clone())
-        },
-        cache,
+        bonds.len(),
+        blocklace.dom().len(),
     )
-    .map(|ordered| {
-        ordered
-            .into_iter()
-            .map(|id| id.content_hash.to_vec())
-            .collect()
-    })
-    .unwrap_or_default()
 }
 
 fn ordered_validators(bonds: &HashMap<NodeId, u64>) -> Vec<NodeId> {
@@ -435,29 +531,41 @@ fn ordered_validators(bonds: &HashMap<NodeId, u64>) -> Vec<NodeId> {
     validators
 }
 
-fn single_validator_ordered_finalized_block_hashes(
-    blocklace: &Blocklace,
-    validator: &NodeId,
-    wavelength: u64,
-) -> Option<Vec<Vec<u8>>> {
+/// Outcome of resolving a single bonded validator's latest finalized leader.
+///
+/// Shared by [`latest_finalized_block_id`] and
+/// [`ordered_block_identities_with_cache`] so both seams make the exact same
+/// fork/leader decision from the exact same blocklace state — see the
+/// module-level doc for why this matters.
+enum SingleValidatorLeader {
+    /// The validator signed two blocks in the same round (equivocation).
+    /// Terminal — callers must not fall back to a fork-unaware computation.
+    Fork,
+    /// A complete wave was found; here is its leader.
+    Found(BlockIdentity),
+    /// No complete wave exists yet for this validator (not adversarial,
+    /// just early). Callers may fall through to a fork-unaware fallback
+    /// (e.g. `weighted_tau`'s self-ratification) in this case only.
+    Incomplete,
+}
+
+/// Resolve the single-validator leader/fork outcome for `validator`.
+///
+/// This is the single source of truth for "has this lone bonded validator
+/// equivocated, and if not, what did it finalize" — see
+/// [`SingleValidatorLeader`] and the module-level doc.
+fn single_validator_leader(blocklace: &Blocklace, validator: &NodeId) -> SingleValidatorLeader {
     let depths = compute_all_depths(blocklace);
+
     if has_same_round_fork(&depths, validator) {
-        return None;
+        return SingleValidatorLeader::Fork;
     }
 
-    let leader = latest_single_validator_finalized_block_id(blocklace, validator, wavelength)?;
-    let observed_blocks = blocklace
-        .observe(&leader)
-        .into_iter()
-        .filter_map(|id| blocklace.get(&id))
-        .collect();
-
-    xsort(&observed_blocks).ok().map(|ordered| {
-        ordered
-            .into_iter()
-            .map(|id| id.content_hash.to_vec())
-            .collect()
-    })
+    match latest_single_validator_finalized_block_id_from_depths(&depths, validator, ES_WAVELENGTH)
+    {
+        Some(leader) => SingleValidatorLeader::Found(leader),
+        None => SingleValidatorLeader::Incomplete,
+    }
 }
 
 fn has_same_round_fork(depths: &HashMap<BlockIdentity, u64>, validator: &NodeId) -> bool {
@@ -478,8 +586,12 @@ fn has_same_round_fork(depths: &HashMap<BlockIdentity, u64>, validator: &NodeId)
     false
 }
 
-fn latest_single_validator_finalized_block_id(
-    blocklace: &Blocklace,
+/// Find the latest complete-wave leader for `validator` from pre-computed
+/// depths. Returns `None` if no wave is fully observed yet for this
+/// validator. Callers needing fork-awareness should go through
+/// [`single_validator_leader`] rather than calling this directly.
+fn latest_single_validator_finalized_block_id_from_depths(
+    depths: &HashMap<BlockIdentity, u64>,
     validator: &NodeId,
     wavelength: u64,
 ) -> Option<BlockIdentity> {
@@ -487,7 +599,6 @@ fn latest_single_validator_finalized_block_id(
         return None;
     }
 
-    let depths = compute_all_depths(blocklace);
     let max_round = depths.values().copied().max()?;
     let latest_wave = wave_of_round(max_round, wavelength)?;
 
