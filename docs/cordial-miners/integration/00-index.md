@@ -45,6 +45,9 @@ and easy to extend as new implementation notes are added.
 12. [12-ordered-output-reintegration.md](./12-ordered-output-reintegration.md)
    - Defines the first clean seam for reconnecting Cordial output back to node-facing behavior
    - Recommends exporting finalized ordered output before attempting proposer-side control
+13. [13-four-node-ordering-convergence.md](./13-four-node-ordering-convergence.md)
+   - Documents the real four-node bounded window-order convergence verifier
+   - Compares mirrored ordered output from all validator gRPC endpoints
 
 ## Scope Of This Track
 
