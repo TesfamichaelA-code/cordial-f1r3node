@@ -438,7 +438,7 @@ impl<A> LiveIngress<A> {
             .filter_map(|hash| by_hash.get(&hash).cloned())
             .collect();
 
-        let total_mirrored_blocks = self.mirror.blocklace().dom().into_iter().count();
+        let total_mirrored_blocks = self.mirror.blocklace().dom().len();
 
         Ok(OrderedFinalizedOutput::new(
             blocks,
