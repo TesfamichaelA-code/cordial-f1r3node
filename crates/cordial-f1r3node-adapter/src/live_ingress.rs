@@ -38,10 +38,12 @@ use cordial_miners_core::types::{BlockContent, NodeId};
 
 use crate::block_translation::BlockMessage;
 use crate::grpc_ingest::{BlocklaceAdapter, GrpcBlockMapper};
+use crate::ordered_output::OrderedFinalizedOutput;
 use crate::shard_conf::CasperShardConf;
+use crate::shared_ordered_output::SharedOrderedOutput;
 use crate::snapshot::{
     CasperSnapshot, SnapshotError, build_snapshot, latest_finalized_block_id,
-    ordered_finalized_block_hashes_with_cache,
+    ordered_block_identities_with_cache, ordered_finalized_block_hashes_with_cache,
 };
 
 /// High-level runtime phase for the live ingress adapter.
@@ -294,6 +296,7 @@ pub struct LiveIngress<A> {
     mapper: GrpcBlockMapper,
     mirror: LiveBlocklaceMirror,
     ordering_cache: OrderingCache,
+    shared_ordered_output: SharedOrderedOutput,
     bonds: HashMap<NodeId, u64>,
     shard_conf: CasperShardConf,
     shard_id: String,
@@ -308,6 +311,7 @@ impl<A> LiveIngress<A> {
             mapper: GrpcBlockMapper::new(),
             mirror: LiveBlocklaceMirror::default(),
             ordering_cache: OrderingCache::default(),
+            shared_ordered_output: SharedOrderedOutput::new(),
             bonds: HashMap::new(),
             shard_conf: CasperShardConf::default(),
             shard_id: String::from("root"),
@@ -327,6 +331,7 @@ impl<A> LiveIngress<A> {
             mapper: GrpcBlockMapper::new(),
             mirror: LiveBlocklaceMirror::default(),
             ordering_cache: OrderingCache::default(),
+            shared_ordered_output: SharedOrderedOutput::new(),
             bonds,
             shard_conf,
             shard_id: shard_id.into(),
@@ -371,6 +376,12 @@ impl<A> LiveIngress<A> {
     /// Return blocks that are waiting on missing predecessors.
     pub fn pending_blocks(&self) -> &HashMap<BlockIdentity, Block> {
         self.mirror.pending()
+    }
+
+    /// Return the shared read-only ordered-output container owned by this
+    /// live ingress instance.
+    pub fn ordered_output_reader(&self) -> &SharedOrderedOutput {
+        &self.shared_ordered_output
     }
 
     /// Replace the bonded validator set used for finality and ordering views.
@@ -424,6 +435,46 @@ impl<A> LiveIngress<A> {
         Ok(ordered_finalized_block_hashes_with_cache(
             blocklace, bonds, cache,
         ))
+    }
+
+    /// Return the latest finalized ordered output through the stable
+    /// `ordered_output` export seam: the finalized-prefix blocks (full
+    /// [`BlockIdentity`] entries, not bare hashes), linearized via weighted
+    /// tau ordering, together with the anchor and consensus metadata needed
+    /// to interpret them.
+    ///
+    /// `anchor` is `None` and `blocks` is empty when the mirrored state does
+    /// not yet have a finalized leader.
+    ///
+    /// This is the boundary inspection tooling and downstream consumers
+    /// should use instead of recomputing ordering against the mirrored
+    /// blocklace directly.
+    pub fn latest_finalized_ordered_output(
+        &mut self,
+        wave_length: u64,
+    ) -> Result<OrderedFinalizedOutput, SnapshotError> {
+        let (blocks, anchor) = {
+            let blocklace = self.mirror.blocklace();
+            let bonds = &self.bonds;
+            let cache = &mut self.ordering_cache;
+            ordered_block_identities_with_cache(blocklace, bonds, cache)
+        };
+
+        let total_mirrored_blocks = self.mirror.blocklace().dom().len();
+
+        let output = OrderedFinalizedOutput::new(
+            blocks,
+            anchor,
+            wave_length,
+            self.bonds.len(),
+            total_mirrored_blocks,
+        );
+
+        self.shared_ordered_output
+            .update(output.clone())
+            .map_err(|_| SnapshotError::OrderedOutputPrefixViolation)?;
+
+        Ok(output)
     }
 
     /// Ingest a trusted block that was reconstructed from a live node-facing
