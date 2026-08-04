@@ -783,12 +783,20 @@ impl PendingBlockBuffer {
     /// explicitly by validation error kind; with the current validation model,
     /// only `MissingPredecessors` is considered retryable for the supplied
     /// `bonds` and `config`.
+    ///
+    /// Returns every definitively rejected block together with its validation
+    /// errors. A block that was buffered as `MissingPredecessors` can turn out
+    /// to be an equivocation once its history arrives, and this replay is the
+    /// only place that rejection happens — callers that retain equivocation
+    /// proof (see `record_rejected_equivocation`) must be handed the rejected
+    /// block *here*, before it is dropped, or the evidence is lost.
     pub fn retry_buffered_blocks(
         &mut self,
         blocklace: &mut Blocklace,
         bonds: &HashMap<NodeId, u64>,
         config: &ValidationConfig,
-    ) {
+    ) -> Vec<(Block, Vec<InvalidBlock>)> {
+        let mut rejected = Vec::new();
         let mut progress = true;
         while progress {
             progress = false;
@@ -821,6 +829,7 @@ impl PendingBlockBuffer {
                         }
                         crate::consensus::validation::ValidationResult::Invalid(errors) => {
                             if !should_keep_buffered_after_validation(&errors) {
+                                rejected.push((block.clone(), errors));
                                 resolved.push(id);
                             }
                         }
@@ -841,5 +850,7 @@ impl PendingBlockBuffer {
             *self.retry_passes.entry(id).or_insert(0) += 1;
         }
         self.evict_stale();
+
+        rejected
     }
 }
