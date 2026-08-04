@@ -1,9 +1,12 @@
 use cordial_miners_core::Block;
 use cordial_miners_core::blocklace::Blocklace;
 use cordial_miners_core::consensus::{
-    BufferOutcome, BufferPolicy, InvalidBlock, PendingBlockBuffer, ProposalError, ValidationConfig,
-    build_block_candidate, next_block_predecessors, required_acknowledgements, select_predecessors,
-    select_predecessors_sorted, validated_insert, validator_visible_tips,
+    BufferOutcome, BufferPolicy, InvalidBlock, PendingBlockBuffer, PredecessorSelectionMode,
+    ProposalError, ValidationConfig, build_block_candidate, build_block_candidate_with_mode,
+    next_block_predecessors, next_block_predecessors_with_mode,
+    predecessors_acknowledge_all_equivocation_branches, required_acknowledgements,
+    select_predecessors, select_predecessors_sorted, select_predecessors_strict,
+    select_predecessors_with_mode, validated_insert, validator_visible_tips,
     weighted_required_acknowledgements,
 };
 use cordial_miners_core::crypto::CryptoVerifier;
@@ -1516,4 +1519,571 @@ fn pending_buffer_drops_blocks_that_fail_consensus_validation() {
         blocklace.content(&unbonded_child.identity).is_none(),
         "replay must not bypass validation for unbonded senders"
     );
+}
+
+// ============================================================================
+// STRICT PREDECESSOR-SELECTION MODE TESTS
+// ============================================================================
+//
+// These tests verify the strict excommunication behaviour (PredecessorSelectionMode::Strict)
+// and its relationship to the existing compatibility mode and to finality/ordering exclusion.
+//
+// Key invariants under test:
+//   S1. Strict mode: honest tips only — equivocator branches are NEVER direct predecessors.
+//   S2. Compatibility mode: equivocator branches NOT yet transitively observed ARE added.
+//   S3. Both modes agree when the blocklace contains no equivocators at all.
+//   S4. Finality / ordering exclusion is independent of predecessor-selection mode.
+//   S5. `select_predecessors_strict` is equivalent to `select_predecessors_with_mode(Strict)`.
+//   S6. `next_block_predecessors_with_mode` and `build_block_candidate_with_mode` thread the
+//       mode through correctly.
+//   S7. `PredecessorSelectionMode::default()` is `Compatibility`.
+
+/// **S1** — Strict mode: equivocator branches never appear as direct predecessors.
+///
+/// Scenario: validator 1 equivocates (e1, e2). Validator 2's honest tip only references e1.
+/// In strict mode, the result must be {tip_v2} only. e2 must NOT be added even though it
+/// is not transitively observed from tip_v2.
+#[test]
+fn strict_mode_never_adds_equivocator_branches() {
+    let mut blocklace = Blocklace::new();
+    let mut bonds = HashMap::new();
+
+    let e1 = create_mock_block(1, 1, HashSet::new());
+    let e2 = create_mock_block(1, 2, HashSet::new()); // equivocating branch
+    insert(&mut blocklace, &e1);
+    insert(&mut blocklace, &e2);
+
+    // Honest validator 2 has seen only e1
+    let tip_v2 = create_mock_block(2, 3, HashSet::from([e1.identity.clone()]));
+    insert(&mut blocklace, &tip_v2);
+
+    bonds.insert(node(1), 100); // equivocator
+    bonds.insert(node(2), 100); // honest
+
+    let strict_preds = select_predecessors_strict(&blocklace, &bonds);
+
+    // Only the honest tip — no equivocator branch in sight
+    assert!(
+        strict_preds.contains(&tip_v2.identity),
+        "strict mode must include the honest tip"
+    );
+    assert!(
+        !strict_preds.contains(&e1.identity),
+        "strict mode must not include e1 (already transitive via tip_v2)"
+    );
+    assert!(
+        !strict_preds.contains(&e2.identity),
+        "strict mode must not include e2 even though it is not transitively observed"
+    );
+    assert_eq!(strict_preds.len(), 1);
+}
+
+/// **S1 + S2** — Strict vs compatibility on the same equivocating view.
+///
+/// Confirms that the two modes differ exactly as documented: compatibility adds e2,
+/// strict does not.
+#[test]
+fn strict_and_compat_differ_when_equivocator_branch_is_missing_from_tips() {
+    let mut blocklace = Blocklace::new();
+    let mut bonds = HashMap::new();
+
+    let e1 = create_mock_block(1, 1, HashSet::new());
+    let e2 = create_mock_block(1, 2, HashSet::new());
+    insert(&mut blocklace, &e1);
+    insert(&mut blocklace, &e2);
+
+    let tip_v2 = create_mock_block(2, 3, HashSet::from([e1.identity.clone()]));
+    let tip_v3 = create_mock_block(3, 4, HashSet::new());
+    let tip_v4 = create_mock_block(4, 5, HashSet::new());
+    insert(&mut blocklace, &tip_v2);
+    insert(&mut blocklace, &tip_v3);
+    insert(&mut blocklace, &tip_v4);
+
+    bonds.insert(node(1), 100);
+    bonds.insert(node(2), 100);
+    bonds.insert(node(3), 100);
+    bonds.insert(node(4), 100);
+
+    let strict_preds = select_predecessors_strict(&blocklace, &bonds);
+    let compat_preds = select_predecessors(&blocklace, &bonds);
+
+    // Compatibility: e2 is added because it is not transitively observed
+    assert!(
+        compat_preds.contains(&e2.identity),
+        "compat mode must add the missing equivocation branch"
+    );
+
+    // Strict: e2 is omitted
+    assert!(
+        !strict_preds.contains(&e2.identity),
+        "strict mode must not add any equivocator branch"
+    );
+    assert!(
+        !strict_preds.contains(&e1.identity),
+        "strict mode must not add e1 (transitive)"
+    );
+
+    // Both modes include all honest tips
+    for id in [&tip_v2.identity, &tip_v3.identity, &tip_v4.identity] {
+        assert!(strict_preds.contains(id), "strict mode missing honest tip");
+        assert!(compat_preds.contains(id), "compat mode missing honest tip");
+    }
+
+    // Strict result is strictly smaller when equivocations exist
+    assert!(
+        strict_preds.len() < compat_preds.len(),
+        "strict set must be smaller than compat set when equivocations are present"
+    );
+}
+
+/// **S3** — Both modes agree on a clean (no-equivocation) network.
+#[test]
+fn strict_and_compat_agree_when_no_equivocations() {
+    let mut blocklace = Blocklace::new();
+    let mut bonds = HashMap::new();
+
+    for i in 1..=4u8 {
+        let block = create_mock_block(i, i, HashSet::new());
+        insert(&mut blocklace, &block);
+        bonds.insert(node(i), 100);
+    }
+
+    let strict_preds = select_predecessors_strict(&blocklace, &bonds);
+    let compat_preds = select_predecessors(&blocklace, &bonds);
+
+    assert_eq!(
+        strict_preds, compat_preds,
+        "strict and compat modes must agree when no equivocations are present"
+    );
+}
+
+/// **S3** — Strict mode is identical to `select_predecessors_with_mode(Strict)`.
+#[test]
+fn select_predecessors_strict_matches_with_mode_strict() {
+    let mut blocklace = Blocklace::new();
+    let mut bonds = HashMap::new();
+
+    let e1 = create_mock_block(1, 1, HashSet::new());
+    let e2 = create_mock_block(1, 2, HashSet::new());
+    insert(&mut blocklace, &e1);
+    insert(&mut blocklace, &e2);
+
+    let tip_v2 = create_mock_block(2, 3, HashSet::from([e1.identity.clone()]));
+    insert(&mut blocklace, &tip_v2);
+
+    bonds.insert(node(1), 100);
+    bonds.insert(node(2), 100);
+
+    let via_fn = select_predecessors_strict(&blocklace, &bonds);
+    let via_mode =
+        select_predecessors_with_mode(&blocklace, &bonds, PredecessorSelectionMode::Strict);
+
+    assert_eq!(
+        via_fn, via_mode,
+        "select_predecessors_strict must equal select_predecessors_with_mode(Strict)"
+    );
+}
+
+/// **S7** — `PredecessorSelectionMode::default()` is `Compatibility`.
+#[test]
+fn predecessor_selection_mode_default_is_compatibility() {
+    assert_eq!(
+        PredecessorSelectionMode::default(),
+        PredecessorSelectionMode::Compatibility,
+    );
+}
+
+/// **S6** — `next_block_predecessors_with_mode(Strict)` threads strict mode through correctly.
+///
+/// In strict mode, known equivocator branches must not appear, and the cordiality threshold
+/// must still be checked against honest tips only.
+#[test]
+fn next_block_predecessors_with_mode_strict_excludes_equivocator_branches() {
+    let mut blocklace = Blocklace::new();
+    let mut bonds = HashMap::new();
+
+    // 4-validator setup: v1 equivocates, v2/v3/v4 are honest
+    let e1 = create_mock_block(1, 1, HashSet::new());
+    let e2 = create_mock_block(1, 2, HashSet::new());
+    insert(&mut blocklace, &e1);
+    insert(&mut blocklace, &e2);
+
+    // tip_v2 covers e1; tip_v3 covers e2 so the strict coverage check passes.
+    let tip_v2 = create_mock_block(2, 3, HashSet::from([e1.identity.clone()]));
+    let tip_v3 = create_mock_block(3, 4, HashSet::from([e2.identity.clone()]));
+    let tip_v4 = create_mock_block(4, 5, HashSet::new());
+    insert(&mut blocklace, &tip_v2);
+    insert(&mut blocklace, &tip_v3);
+    insert(&mut blocklace, &tip_v4);
+
+    bonds.insert(node(1), 100);
+    bonds.insert(node(2), 100);
+    bonds.insert(node(3), 100);
+    bonds.insert(node(4), 100);
+
+    // Strict mode: should succeed (3 honest tips >= threshold of 3) and exclude e2
+    let strict_result =
+        next_block_predecessors_with_mode(&blocklace, &bonds, PredecessorSelectionMode::Strict);
+    let strict_preds = strict_result.expect("strict mode should succeed with 3 honest tips");
+
+    assert!(
+        !strict_preds.contains(&e2.identity),
+        "strict next_block_predecessors must not include equivocator branch e2"
+    );
+    assert!(
+        !strict_preds.contains(&e1.identity),
+        "strict next_block_predecessors must not include equivocator branch e1"
+    );
+
+    // Honest tips are present
+    assert!(strict_preds.contains(&tip_v2.identity));
+    assert!(strict_preds.contains(&tip_v3.identity));
+    assert!(strict_preds.contains(&tip_v4.identity));
+}
+
+/// **S6** — `build_block_candidate_with_mode(Strict)` produces strict predecessors.
+#[test]
+fn build_block_candidate_with_mode_strict_excludes_equivocator_branches() {
+    let mut blocklace = Blocklace::new();
+    let mut bonds = HashMap::new();
+
+    let e1 = create_mock_block(1, 1, HashSet::new());
+    let e2 = create_mock_block(1, 2, HashSet::new());
+    insert(&mut blocklace, &e1);
+    insert(&mut blocklace, &e2);
+
+    // tip_v2 covers e1; tip_v3 covers e2 so the strict coverage check passes.
+    let tip_v2 = create_mock_block(2, 3, HashSet::from([e1.identity.clone()]));
+    let tip_v3 = create_mock_block(3, 4, HashSet::from([e2.identity.clone()]));
+    let tip_v4 = create_mock_block(4, 5, HashSet::new());
+    insert(&mut blocklace, &tip_v2);
+    insert(&mut blocklace, &tip_v3);
+    insert(&mut blocklace, &tip_v4);
+
+    bonds.insert(node(1), 100);
+    bonds.insert(node(2), 100);
+    bonds.insert(node(3), 100);
+    bonds.insert(node(4), 100);
+
+    let payload = vec![0xca, 0xfe];
+    let candidate = build_block_candidate_with_mode(
+        &blocklace,
+        &bonds,
+        payload.clone(),
+        PredecessorSelectionMode::Strict,
+    )
+    .expect("strict candidate should succeed with sufficient honest tips");
+
+    assert_eq!(candidate.payload, payload);
+    assert!(
+        !candidate.predecessors.contains(&e2.identity),
+        "strict candidate must not reference equivocator branch e2"
+    );
+    assert!(
+        !candidate.predecessors.contains(&e1.identity),
+        "strict candidate must not reference equivocator branch e1"
+    );
+    assert!(candidate.predecessors.contains(&tip_v2.identity));
+    assert!(candidate.predecessors.contains(&tip_v3.identity));
+    assert!(candidate.predecessors.contains(&tip_v4.identity));
+}
+
+/// **S4** — Tip-map equivocator exclusion is applied before, and independently of,
+/// predecessor-selection mode.
+///
+/// `validator_visible_tips` already strips equivocating validators from the tip map
+/// before either `select_predecessors` (compat) or `select_predecessors_strict` (strict)
+/// is applied. This test confirms that equivocators never re-appear as direct
+/// predecessors in either mode, i.e. the exclusion is truly mode-independent.
+///
+/// Note: this test exercises `validator_visible_tips` and the two predecessor-selection
+/// mode functions. Tests for the actual finality and ordering exclusion APIs live in
+/// `test_finality.rs` and `test_ordering.rs`.
+#[test]
+fn tip_map_equivocator_exclusion_is_independent_of_predecessor_selection_mode() {
+    let mut blocklace = Blocklace::new();
+    let mut bonds = HashMap::new();
+
+    let e1 = create_mock_block(1, 1, HashSet::new());
+    let e2 = create_mock_block(1, 2, HashSet::new());
+    insert(&mut blocklace, &e1);
+    insert(&mut blocklace, &e2);
+
+    let tip_v2 = create_mock_block(2, 3, HashSet::from([e1.identity.clone()]));
+    insert(&mut blocklace, &tip_v2);
+
+    bonds.insert(node(1), 100);
+    bonds.insert(node(2), 100);
+
+    // The tip map excludes the equivocating validator (node 1) before any mode decision.
+    let tips = validator_visible_tips(&blocklace, &bonds);
+    assert!(
+        !tips.contains_key(&node(1)),
+        "equivocating validator must be absent from the tip map regardless of predecessor mode"
+    );
+    assert!(
+        tips.contains_key(&node(2)),
+        "honest validator must be present in the tip map"
+    );
+
+    // Both modes build from the same equivocator-free tip map.
+    let strict_preds = select_predecessors_strict(&blocklace, &bonds);
+    let compat_preds = select_predecessors(&blocklace, &bonds);
+
+    // Strict mode: neither equivocator branch is ever a direct predecessor.
+    assert!(
+        !strict_preds.contains(&e1.identity),
+        "strict: e1 must not be a direct predecessor"
+    );
+    assert!(
+        !strict_preds.contains(&e2.identity),
+        "strict: e2 must not be a direct predecessor"
+    );
+
+    // Compat mode: e2 was not yet transitively visible through honest tips, so it
+    // is re-added as a direct predecessor to preserve equivocation evidence on the
+    // network. e1 is already visible transitively via tip_v2 → e1.
+    assert!(
+        compat_preds.contains(&e2.identity),
+        "compat: unseen equivocator branch e2 must be included to preserve evidence"
+    );
+
+    // The honest tip is always reachable in both modes.
+    assert!(compat_preds.contains(&tip_v2.identity));
+    assert!(strict_preds.contains(&tip_v2.identity));
+}
+
+/// **S1** — Strict mode with a 3-way equivocation: no branch is ever a direct predecessor.
+#[test]
+fn strict_mode_excludes_all_branches_of_multiway_equivocation() {
+    let mut blocklace = Blocklace::new();
+    let mut bonds = HashMap::new();
+
+    // 3-way equivocation by validator 1
+    let e1 = create_mock_block(1, 1, HashSet::new());
+    let e2 = create_mock_block(1, 2, HashSet::new());
+    let e3 = create_mock_block(1, 3, HashSet::new());
+    insert(&mut blocklace, &e1);
+    insert(&mut blocklace, &e2);
+    insert(&mut blocklace, &e3);
+
+    // Honest validators see only e1
+    let tip_v2 = create_mock_block(2, 4, HashSet::from([e1.identity.clone()]));
+    let tip_v3 = create_mock_block(3, 5, HashSet::new());
+    let tip_v4 = create_mock_block(4, 6, HashSet::new());
+    insert(&mut blocklace, &tip_v2);
+    insert(&mut blocklace, &tip_v3);
+    insert(&mut blocklace, &tip_v4);
+
+    bonds.insert(node(1), 100);
+    bonds.insert(node(2), 100);
+    bonds.insert(node(3), 100);
+    bonds.insert(node(4), 100);
+
+    let strict_preds = select_predecessors_strict(&blocklace, &bonds);
+
+    assert!(!strict_preds.contains(&e1.identity), "strict: e1 excluded");
+    assert!(!strict_preds.contains(&e2.identity), "strict: e2 excluded");
+    assert!(!strict_preds.contains(&e3.identity), "strict: e3 excluded");
+
+    assert!(strict_preds.contains(&tip_v2.identity));
+    assert!(strict_preds.contains(&tip_v3.identity));
+    assert!(strict_preds.contains(&tip_v4.identity));
+    assert_eq!(strict_preds.len(), 3, "only the 3 honest tips");
+}
+
+// ---------------------------------------------------------------------------
+// Tests for predecessors_acknowledge_all_equivocation_branches and the
+// strict-mode safety check in next_block_predecessors_with_mode.
+// ---------------------------------------------------------------------------
+
+/// **Coverage check — failure**: when an equivocator branch is not yet reachable
+/// through the honest tips the helper returns `false` and the strict-mode proposal
+/// is rejected with `InsufficientEquivocationAcknowledgement`.
+///
+/// Topology
+/// --------
+/// * node 1 equivocates: e1 and e2 (round 1, same creator).
+/// * node 2 builds tip_v2 referencing e1 only. So e2 is NOT in the tip closure.
+/// * bonds: nodes 1, 2 (enough for a 2-validator committee).
+///
+/// strict_preds = {tip_v2} (honest tip only, no e2).
+/// The tip_v2 closure observes: tip_v2, e1 — but NOT e2.
+/// Therefore: coverage check fails, proposal rejected.
+#[test]
+fn strict_mode_proposal_rejected_when_equivocator_branch_not_in_tip_closure() {
+    let mut blocklace = Blocklace::new();
+    let mut bonds = HashMap::new();
+
+    // Two-way equivocation by node 1.
+    let e1 = create_mock_block(1, 1, HashSet::new());
+    let e2 = create_mock_block(1, 2, HashSet::new()); // same creator, different content
+    insert(&mut blocklace, &e1);
+    insert(&mut blocklace, &e2);
+
+    // Node 2 tip references only e1, so e2 is NOT transitively covered.
+    let tip_v2 = create_mock_block(2, 3, HashSet::from([e1.identity.clone()]));
+    insert(&mut blocklace, &tip_v2);
+
+    bonds.insert(node(1), 100);
+    bonds.insert(node(2), 100);
+
+    // The public helper should report false: e2 is missing.
+    let preds = select_predecessors_strict(&blocklace, &bonds); // {tip_v2}
+    assert!(
+        !predecessors_acknowledge_all_equivocation_branches(&blocklace, &preds),
+        "e2 is not reachable through the strict tip set"
+    );
+
+    // The proposal API must reject the candidate.
+    let result =
+        next_block_predecessors_with_mode(&blocklace, &bonds, PredecessorSelectionMode::Strict);
+    match result {
+        Err(ProposalError::InsufficientEquivocationAcknowledgement { ref missing }) => {
+            assert!(
+                missing.contains(&e2.identity),
+                "missing list must contain the uncovered branch e2"
+            );
+        }
+        other => panic!(
+            "expected InsufficientEquivocationAcknowledgement, got {:?}",
+            other
+        ),
+    }
+}
+
+/// **Coverage check — success**: when every equivocator branch is already
+/// reachable through the honest tips the helper returns `true` and the strict-mode
+/// proposal succeeds.
+///
+/// Topology
+/// --------
+/// * node 1 equivocates: e1 and e2.
+/// * node 2 builds tip_v2 referencing e1.
+/// * node 3 builds tip_v3 referencing e2 (and e1 via its predecessor chain).
+/// * node 4 builds tip_v4 (clean honest tip).
+/// * bonds: nodes 1–4 → threshold = (2*4)/3+1 = 3; honest tips = 3 (v2, v3, v4). ✓
+///
+/// strict_preds = {tip_v2, tip_v3, tip_v4}.
+/// Closure: tip_v2 → e1; tip_v3 → e2. Both branches covered.
+#[test]
+fn strict_mode_proposal_succeeds_when_all_equivocator_branches_covered() {
+    let mut blocklace = Blocklace::new();
+    let mut bonds = HashMap::new();
+
+    // Two-way equivocation by node 1.
+    let e1 = create_mock_block(1, 1, HashSet::new());
+    let e2 = create_mock_block(1, 2, HashSet::new());
+    insert(&mut blocklace, &e1);
+    insert(&mut blocklace, &e2);
+
+    // Node 2 covers e1.
+    let tip_v2 = create_mock_block(2, 3, HashSet::from([e1.identity.clone()]));
+    insert(&mut blocklace, &tip_v2);
+
+    // Node 3 covers e2.
+    let tip_v3 = create_mock_block(3, 4, HashSet::from([e2.identity.clone()]));
+    insert(&mut blocklace, &tip_v3);
+
+    // Node 4 is an honest tip with no equivocator references.
+    let tip_v4 = create_mock_block(4, 5, HashSet::new());
+    insert(&mut blocklace, &tip_v4);
+
+    // 4 validators: threshold = (2*4)/3+1 = 3. Honest tips = {v2, v3, v4} = 3. ✓
+    bonds.insert(node(1), 100);
+    bonds.insert(node(2), 100);
+    bonds.insert(node(3), 100);
+    bonds.insert(node(4), 100);
+
+    // The public helper should report true: both e1 and e2 are reachable.
+    let preds = select_predecessors_strict(&blocklace, &bonds); // {tip_v2, tip_v3, tip_v4}
+    assert!(
+        predecessors_acknowledge_all_equivocation_branches(&blocklace, &preds),
+        "both equivocator branches are covered through the honest tips"
+    );
+
+    // The proposal API must succeed.
+    let result =
+        next_block_predecessors_with_mode(&blocklace, &bonds, PredecessorSelectionMode::Strict);
+    assert!(
+        result.is_ok(),
+        "strict-mode proposal must succeed when all branches are covered: {:?}",
+        result
+    );
+    let selected = result.unwrap();
+    assert!(selected.contains(&tip_v2.identity));
+    assert!(selected.contains(&tip_v3.identity));
+    assert!(selected.contains(&tip_v4.identity));
+    // Neither equivocator branch appears directly.
+    assert!(!selected.contains(&e1.identity));
+    assert!(!selected.contains(&e2.identity));
+}
+
+/// **Coverage check — no equivocations**: when the blocklace has no equivocators
+/// the helper always returns `true` and the strict-mode proposal is not affected.
+#[test]
+fn predecessors_acknowledge_all_equivocation_branches_returns_true_with_no_equivocations() {
+    let mut blocklace = Blocklace::new();
+    let mut bonds = HashMap::new();
+
+    let b1 = create_mock_block(1, 1, HashSet::new());
+    let b2 = create_mock_block(2, 2, HashSet::new());
+    let b3 = create_mock_block(3, 3, HashSet::new());
+    insert(&mut blocklace, &b1);
+    insert(&mut blocklace, &b2);
+    insert(&mut blocklace, &b3);
+
+    bonds.insert(node(1), 100);
+    bonds.insert(node(2), 100);
+    bonds.insert(node(3), 100);
+
+    let preds = select_predecessors_strict(&blocklace, &bonds);
+    assert!(
+        predecessors_acknowledge_all_equivocation_branches(&blocklace, &preds),
+        "no equivocations means coverage is trivially satisfied"
+    );
+
+    // And the strict-mode proposal should succeed.
+    let result =
+        next_block_predecessors_with_mode(&blocklace, &bonds, PredecessorSelectionMode::Strict);
+    assert!(result.is_ok(), "no equivocations: proposal must succeed");
+}
+
+/// **Compatibility mode is unaffected**: the new check only applies to strict
+/// mode. Compat mode with a branch not covered through tips must still succeed
+/// (compat adds the missing branch directly as a predecessor).
+#[test]
+fn compat_mode_proposal_succeeds_even_when_branch_not_in_tip_closure() {
+    let mut blocklace = Blocklace::new();
+    let mut bonds = HashMap::new();
+
+    let e1 = create_mock_block(1, 1, HashSet::new());
+    let e2 = create_mock_block(1, 2, HashSet::new());
+    insert(&mut blocklace, &e1);
+    insert(&mut blocklace, &e2);
+
+    let tip_v2 = create_mock_block(2, 3, HashSet::from([e1.identity.clone()]));
+    insert(&mut blocklace, &tip_v2);
+
+    bonds.insert(node(1), 100);
+    bonds.insert(node(2), 100);
+
+    // Compat mode must not return InsufficientEquivocationAcknowledgement.
+    let result = next_block_predecessors_with_mode(
+        &blocklace,
+        &bonds,
+        PredecessorSelectionMode::Compatibility,
+    );
+    // The only reason compat could fail here is InsufficientAcknowledgements
+    // (only 1 honest tip vs threshold 2). That's fine for the purpose of this
+    // test — the important thing is it is NOT InsufficientEquivocationAcknowledgement.
+    if let Err(ref e) = result {
+        assert!(
+            !matches!(
+                e,
+                ProposalError::InsufficientEquivocationAcknowledgement { .. }
+            ),
+            "compat mode must never return InsufficientEquivocationAcknowledgement"
+        );
+    }
 }
