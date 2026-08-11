@@ -57,6 +57,13 @@ and easy to extend as new implementation notes are added.
 16. [16-ordered-output-file-export.md](./16-ordered-output-file-export.md)
     - Documents the JSON file export seam for finalized ordered output
     - Shows how sidecar tooling can read tau output without touching `f1r3node`
+17. [13-deploy-ingress-path.md](./13-deploy-ingress-path.md) · [13-four-node-ordering-convergence.md](./13-four-node-ordering-convergence.md)
+    - Deploy-to-ordering trace: correlates observed deploy signatures with block inclusion and finalized output
+    - Four-node convergence: verifies that real f1r3node validators export the same finalized tau order
+18. [18-pruning-and-cache-invalidation-policy.md](./18-pruning-and-cache-invalidation-policy.md)
+    - Documents what can be pruned after finalized ordered output is exported
+    - Explains structural closure preservation and `OrderingCache` invalidation triggers
+    - Covers the equivocation-evidence / cache interaction: why evidence recording does not flush the cache
 
 ## Scope Of This Track
 
@@ -71,6 +78,7 @@ The integration notes in this folder focus on:
 
 Future notes in this folder are expected to cover:
 
+- persistence and restart semantics: wiring LMDB repository into `LiveIngress`
 - transport wiring for ordered output (gRPC / IPC serving of `OrderedFinalizedOutput`)
 - push / notification delivery for ordered output consumers
 - proposer-facing integration only after the consumer boundary is validated
