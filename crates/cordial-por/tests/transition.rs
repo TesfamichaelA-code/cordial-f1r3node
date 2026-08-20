@@ -1,16 +1,31 @@
 use cordial_miners_core::NodeId;
 use cordial_por::{
-    PorConfig, PorError, ReputationEntry, ReputationVector, blend_reputation_transition,
+    MissingEntryPolicy, PorConfig, PorError, ReputationEntry, ReputationVector,
+    blend_reputation_transition,
 };
 
 fn cfg(scale: u64, alpha: u64) -> PorConfig {
+    cfg_with(scale, alpha, 0, MissingEntryPolicy::default())
+}
+
+fn cfg_with(
+    scale: u64,
+    alpha: u64,
+    initial_reputation: u64,
+    missing_entry_policy: MissingEntryPolicy,
+) -> PorConfig {
     PorConfig {
         scale,
-        initial_reputation: 0,
+        initial_reputation,
         liquid_rank_alpha: alpha,
         minimum_rating: 0,
         maximum_rating: scale,
+        missing_entry_policy,
     }
+}
+
+fn reject(scale: u64, alpha: u64) -> PorConfig {
+    cfg_with(scale, alpha, 0, MissingEntryPolicy::Reject)
 }
 
 fn entry(node: u8, reputation: u64) -> ReputationEntry {
@@ -58,7 +73,7 @@ fn missing_previous_reputation_is_rejected() {
     let previous = vector(6, vec![entry(1, 50)]);
 
     assert_eq!(
-        blend_reputation_transition(&contribution, &previous, &cfg(100, 60)),
+        blend_reputation_transition(&contribution, &previous, &reject(100, 60)),
         Err(PorError::MissingPreviousReputation)
     );
 }
@@ -69,7 +84,7 @@ fn extra_previous_reputation_entry_is_rejected() {
     let previous = vector(6, vec![entry(1, 50), entry(2, 70), entry(3, 20)]);
 
     assert_eq!(
-        blend_reputation_transition(&contribution, &previous, &cfg(100, 50)),
+        blend_reputation_transition(&contribution, &previous, &reject(100, 50)),
         Err(PorError::MissingContributionEntry)
     );
 }
@@ -80,7 +95,7 @@ fn different_equal_length_node_sets_are_rejected() {
     let previous = vector(6, vec![entry(1, 50), entry(3, 70)]);
 
     assert_eq!(
-        blend_reputation_transition(&contribution, &previous, &cfg(100, 50)),
+        blend_reputation_transition(&contribution, &previous, &reject(100, 50)),
         Err(PorError::MissingPreviousReputation)
     );
 }

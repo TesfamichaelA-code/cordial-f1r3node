@@ -1,5 +1,31 @@
 use crate::types::{RatingScore, ReputationWeight};
 
+/// How the transition treats a node that appears in only one of the two vectors
+/// it blends.
+///
+/// A round is sparse when a node receives no ratings: Liquid Rank emits no
+/// contribution entry for it. Naming the fallback keeps reputation from being
+/// carried forward silently, which is what the original strict rejection
+/// guarded against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MissingEntryPolicy {
+    /// Reject the round unless both vectors cover the same node set.
+    Reject,
+
+    /// Treat an unrated node's contribution as its previous reputation, which
+    /// leaves that node's reputation unchanged for the round.
+    ///
+    /// Absence of ratings is not evidence of inactivity: a node can be online
+    /// and simply not interacted with. Punishing that belongs to the inactivity
+    /// penalty stage, which knows the missed-round count.
+    #[default]
+    CarryForward,
+
+    /// Treat an unrated node's contribution as `initial_reputation`, drifting
+    /// unrated nodes toward the configured baseline.
+    Neutral,
+}
+
 /// Configuration parameters for PoR calculations and transitions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PorConfig {
@@ -18,6 +44,10 @@ pub struct PorConfig {
 
     /// Maximum accepted rating.
     pub maximum_rating: RatingScore,
+
+    /// Fallback applied when the contribution and previous reputation vectors
+    /// cover different node sets.
+    pub missing_entry_policy: MissingEntryPolicy,
 }
 
 impl PorConfig {
@@ -35,6 +65,8 @@ impl PorConfig {
             minimum_rating: 0,
 
             maximum_rating: scale,
+
+            missing_entry_policy: MissingEntryPolicy::default(),
         }
     }
 }

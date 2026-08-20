@@ -1,7 +1,8 @@
 use cordial_miners_core::NodeId;
 use cordial_por::{
-    PorConfig, PorError, RatingRecord, ReputationBlock, ReputationBlockHeader, ReputationEntry,
-    ReputationList, ReputationVector, replay_reputation_transition, verify_reputation_transition,
+    MissingEntryPolicy, PorConfig, PorError, RatingRecord, ReputationBlock, ReputationBlockHeader,
+    ReputationEntry, ReputationList, ReputationVector, replay_reputation_transition,
+    verify_reputation_transition,
 };
 
 const ROUND: u64 = 7;
@@ -14,6 +15,7 @@ fn config() -> PorConfig {
         liquid_rank_alpha: 50,
         minimum_rating: 0,
         maximum_rating: 100,
+        missing_entry_policy: MissingEntryPolicy::default(),
     }
 }
 
