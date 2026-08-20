@@ -179,18 +179,33 @@ The `src/transition.rs` module computes the next vector with:
 R_next_i = (alpha * P_i + (scale - alpha) * R_k_i) / scale
 ```
 
-It requires both vectors to contain the same node set in canonical `NodeId`
-order and requires the contribution round to immediately follow the previous
-reputation round. The calculation rejects invalid scale or alpha values and
-uses checked `u128` fixed-point intermediates before converting each result
-back to `ReputationWeight`. The contribution vector supplies the output order
-and round.
+It requires both vectors to be in canonical `NodeId` order and requires the
+contribution round to immediately follow the previous reputation round. The
+calculation rejects invalid scale or alpha values and uses checked `u128`
+fixed-point intermediates before converting each result back to
+`ReputationWeight`. The output covers the union of the two node sets, in
+canonical order, and takes its round from the contribution vector.
 
-This transition uses a strict node-set policy: the contribution and previous
-reputation vectors must contain the same canonical `NodeId` set. A round with
-missing contribution entries is rejected; no fallback or no-rating reputation
-policy is introduced here. Full contribution coverage is an upstream
-requirement.
+Rounds are sparse in practice: a node that receives no ratings produces no
+Liquid-Rank contribution entry. Nodes present on only one side are resolved
+through `PorConfig::missing_entry_policy` rather than rejecting the round:
+
+| Policy | Node with no contribution | Node with no previous reputation |
+|--------|---------------------------|----------------------------------|
+| `Reject` | `MissingContributionEntry` | `MissingPreviousReputation` |
+| `CarryForward` (default) | `P_i := R_k_i`, so reputation is unchanged | seeded from `initial_reputation` |
+| `Neutral` | `P_i := initial_reputation` | seeded from `initial_reputation` |
+
+Naming the fallback is the point: the earlier strict rejection existed to stop
+reputation being carried forward *silently* when ratings were incomplete, and a
+configured policy keeps that property while letting sparse rounds proceed. The
+policy lives in `PorConfig` because it is part of the replayed input for
+`verify_reputation_transition` — two validators must not be able to disagree
+about a reputation block because they resolved a missing entry differently.
+
+Absence of ratings is not evidence of inactivity: a node can be online and
+simply not interacted with. Punishing genuine inactivity belongs to the
+`InactivityPenalty` stage, which carries the missed-round count.
 
 The `src/clamp.rs` module applies the paper sigmoid-style clamp with:
 
