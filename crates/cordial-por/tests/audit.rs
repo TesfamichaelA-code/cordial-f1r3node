@@ -19,6 +19,13 @@ fn config() -> PorConfig {
     }
 }
 
+fn config_with_initial_reputation(initial_reputation: u64) -> PorConfig {
+    PorConfig {
+        initial_reputation,
+        ..config()
+    }
+}
+
 fn node(id: u8) -> NodeId {
     NodeId(vec![id])
 }
@@ -233,5 +240,94 @@ fn replays_deterministically_from_shuffled_ratings() {
             &config()
         ),
         Ok(())
+    );
+}
+
+/// Round 7 with no ratings at all for node 3.
+fn sparse_ratings() -> Vec<RatingRecord> {
+    vec![
+        rating(2, 1, 80),
+        rating(3, 1, 40),
+        rating(1, 2, 60),
+        rating(3, 2, 100),
+    ]
+}
+
+#[test]
+fn replays_a_sparse_round_and_carries_the_unrated_node_forward() {
+    let replayed =
+        replay_reputation_transition(&previous_reputation(), &sparse_ratings(), ROUND, &config())
+            .unwrap();
+
+    // Nodes 1 and 2 move as in the fully rated round; node 3 received no
+    // ratings, so the default carry-forward policy leaves it at 20.
+    assert_eq!(
+        replayed.entries,
+        vec![entry(1, 64), entry(2, 61), entry(3, 20)]
+    );
+}
+
+#[test]
+fn verifies_a_block_built_from_a_sparse_round() {
+    let block = block(ROUND, vec![entry(1, 64), entry(2, 61), entry(3, 20)]);
+
+    assert_eq!(
+        verify_reputation_transition(&previous_reputation(), &sparse_ratings(), &block, &config()),
+        Ok(())
+    );
+}
+
+#[test]
+fn sparse_round_replay_is_order_independent() {
+    let mut shuffled = sparse_ratings();
+    shuffled.reverse();
+
+    assert_eq!(
+        replay_reputation_transition(&previous_reputation(), &shuffled, ROUND, &config()).unwrap(),
+        replay_reputation_transition(&previous_reputation(), &sparse_ratings(), ROUND, &config())
+            .unwrap()
+    );
+}
+
+/// Round 7 where node 4 is rated by nodes 1 and 2 but rates nobody itself, so
+/// it reaches the transition with a contribution and no previous reputation.
+fn ratings_with_new_node() -> Vec<RatingRecord> {
+    let mut ratings = ratings();
+    ratings.push(rating(1, 4, 100));
+    ratings.push(rating(2, 4, 60));
+    ratings
+}
+
+#[test]
+fn seeds_a_new_node_from_initial_reputation() {
+    let config = config_with_initial_reputation(20);
+
+    let replayed = replay_reputation_transition(
+        &previous_reputation(),
+        &ratings_with_new_node(),
+        ROUND,
+        &config,
+    )
+    .unwrap();
+
+    assert_eq!(
+        replayed.entries,
+        vec![entry(1, 64), entry(2, 61), entry(3, 61), entry(4, 57)]
+    );
+}
+
+#[test]
+fn a_new_node_that_also_rates_is_still_rejected_by_liquid_rank() {
+    let mut ratings = ratings_with_new_node();
+    ratings.push(rating(4, 1, 50));
+
+    assert_eq!(
+        replay_reputation_transition(
+            &previous_reputation(),
+            &ratings,
+            ROUND,
+            &config_with_initial_reputation(20)
+        ),
+        Err(PorError::MissingRaterReputation)
     );
 }

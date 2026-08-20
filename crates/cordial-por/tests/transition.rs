@@ -228,3 +228,58 @@ fn sums_weighted_terms_before_dividing() {
 
     assert_eq!(next.values, vec![entry(1, 1)]);
 }
+
+#[test]
+fn carry_forward_leaves_an_unrated_node_unchanged() {
+    let contribution = vector(7, vec![entry(1, 90)]);
+    let previous = vector(6, vec![entry(1, 50), entry(2, 80)]);
+    let config = cfg_with(100, 50, 20, MissingEntryPolicy::CarryForward);
+
+    let next = blend_reputation_transition(&contribution, &previous, &config).unwrap();
+
+    assert_eq!(next.values, vec![entry(1, 70), entry(2, 80)]);
+}
+
+#[test]
+fn neutral_drifts_an_unrated_node_toward_initial_reputation() {
+    let contribution = vector(7, vec![entry(1, 90)]);
+    let previous = vector(6, vec![entry(1, 50), entry(2, 80)]);
+    let config = cfg_with(100, 50, 20, MissingEntryPolicy::Neutral);
+
+    let next = blend_reputation_transition(&contribution, &previous, &config).unwrap();
+
+    assert_eq!(next.values, vec![entry(1, 70), entry(2, 50)]);
+}
+
+#[test]
+fn new_node_is_seeded_from_initial_reputation() {
+    let contribution = vector(7, vec![entry(1, 90), entry(2, 60)]);
+    let previous = vector(6, vec![entry(1, 50)]);
+    let config = cfg_with(100, 50, 20, MissingEntryPolicy::CarryForward);
+
+    let next = blend_reputation_transition(&contribution, &previous, &config).unwrap();
+
+    assert_eq!(next.values, vec![entry(1, 70), entry(2, 40)]);
+}
+
+#[test]
+fn output_covers_the_union_in_canonical_order() {
+    let contribution = vector(7, vec![entry(1, 90), entry(3, 60)]);
+    let previous = vector(6, vec![entry(2, 40), entry(3, 80)]);
+    let config = cfg_with(100, 50, 20, MissingEntryPolicy::CarryForward);
+
+    let next = blend_reputation_transition(&contribution, &previous, &config).unwrap();
+
+    assert_eq!(next.values, vec![entry(1, 55), entry(2, 40), entry(3, 70)]);
+}
+
+#[test]
+fn reject_policy_still_refuses_a_new_node() {
+    let contribution = vector(7, vec![entry(1, 90), entry(2, 60)]);
+    let previous = vector(6, vec![entry(1, 50)]);
+
+    assert_eq!(
+        blend_reputation_transition(&contribution, &previous, &reject(100, 50)),
+        Err(PorError::MissingPreviousReputation)
+    );
+}
