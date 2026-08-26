@@ -193,7 +193,7 @@ through `PorConfig::missing_entry_policy` rather than rejecting the round:
 | Policy | Node with no contribution | Node with no previous reputation |
 |--------|---------------------------|----------------------------------|
 | `Reject` | `MissingContributionEntry` | `MissingPreviousReputation` |
-| `CarryForward` (default) | `P_i := R_k_i`, so reputation is unchanged | seeded from `initial_reputation` |
+| `CarryForward` (default) | `P_i := R_k_i`, and the sigmoid clamp is skipped for that node so the finalized reputation is unchanged | seeded from `initial_reputation` |
 | `Neutral` | `P_i := initial_reputation` | seeded from `initial_reputation` |
 
 Naming the fallback is the point: the earlier strict rejection existed to stop
@@ -206,6 +206,14 @@ about a reputation block because they resolved a missing entry differently.
 Absence of ratings is not evidence of inactivity: a node can be online and
 simply not interacted with. Punishing genuine inactivity belongs to the
 `InactivityPenalty` stage, which carries the missed-round count.
+
+The sigmoid clamp is not idempotent. Clamping an already-finalized CarryForward
+value would shrink it every sparse round — at production defaults
+(`scale = 1_000_000_000`, `R = 200_000_000`) that is a drop to `196_116_135`,
+about 1.94% per round, which is an implicit inactivity penalty. The pipeline
+therefore clamps with `clamp_reputation_transition`, which leaves CarryForward
+entries untouched and still clamps rated nodes, newly seeded nodes, and every
+entry under `Reject` or `Neutral`.
 
 The `src/clamp.rs` module applies the paper sigmoid-style clamp with:
 
@@ -222,6 +230,10 @@ clamp_fixed = round((r * scale) / sqrt(scale^2 + r^2))
 It uses deterministic integer arithmetic only, rejects zero scale, reports
 checked arithmetic overflow as `PorError::ClampOverflow`, preserves vector
 round and ordering, and does not mutate `ReputationState`.
+`clamp_reputation_vector` clamps every entry. The audit replay and any other
+full-pipeline caller use `clamp_reputation_transition`, which takes the same
+previous and contribution vectors as the blend so CarryForward entries are not
+clamped a second time.
 
 The `src/state.rs` module applies a finalized vector with:
 
@@ -256,11 +268,12 @@ ratings + previous reputation + config -> expected ReputationList
 ```
 
 `replay_reputation_transition` runs batching, matrix construction,
-normalization, Liquid Rank, alpha blending, and clamping for one round, so a
-shuffled rating set yields the same list. `verify_reputation_transition` applies
-`validate_reputation_block` to the proposed block first, so an audited block is
-held to the same structural rules as a constructed one, then compares the
-replayed list against `ReputationBlock.reputation_list`. Node-set and value
+normalization, Liquid Rank, alpha blending, and `clamp_reputation_transition`
+for one round, so a shuffled rating set yields the same list.
+`verify_reputation_transition` applies `validate_reputation_block` to the
+proposed block first, so an audited block is held to the same structural rules
+as a constructed one, then compares the replayed list against
+`ReputationBlock.reputation_list`. Node-set and value
 differences are reported separately as `MissingReputationBlockEntry`,
 `UnexpectedReputationBlockEntry`, and `ReputationValueMismatch`. Replay is
 read-only: it does not mutate `ReputationState`, publish blocks, or perform
