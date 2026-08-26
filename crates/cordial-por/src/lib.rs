@@ -34,6 +34,6 @@ pub use types::{
     ReputationEntry, ReputationList, ReputationRound, ReputationVector, ReputationWeight,
 };
 
-pub use clamp::{clamp_reputation_value, clamp_reputation_vector};
+pub use clamp::{clamp_reputation_transition, clamp_reputation_value, clamp_reputation_vector};
 pub use transition::blend_reputation_transition;
 pub use weights::reputation_weights;

@@ -5,6 +5,9 @@
 //! by only one of the two vectors are resolved through
 //! `PorConfig::missing_entry_policy` rather than rejected outright. It does not
 //! clamp values, mutate reputation state, or construct a reputation block.
+//! CarryForward copies the previous reputation into the blend; the pipeline
+//! clamp (`clamp_reputation_transition`) then skips those entries so the
+//! sigmoid does not decay an already-finalized value.
 
 use crate::{
     config::{MissingEntryPolicy, PorConfig},
