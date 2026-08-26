@@ -1,8 +1,8 @@
 use cordial_miners_core::NodeId;
 use cordial_por::{
     MissingEntryPolicy, PorConfig, PorError, RatingRecord, ReputationBlock, ReputationBlockHeader,
-    ReputationEntry, ReputationList, ReputationVector, replay_reputation_transition,
-    verify_reputation_transition,
+    ReputationEntry, ReputationList, ReputationVector, clamp_reputation_value,
+    replay_reputation_transition, verify_reputation_transition,
 };
 
 const ROUND: u64 = 7;
@@ -260,7 +260,8 @@ fn replays_a_sparse_round_and_carries_the_unrated_node_forward() {
             .unwrap();
 
     // Nodes 1 and 2 move as in the fully rated round; node 3 received no
-    // ratings, so the default carry-forward policy leaves it at 20.
+    // ratings, so CarryForward copies its previous value and the pipeline
+    // clamp leaves that already-finalized reputation untouched.
     assert_eq!(
         replayed.entries,
         vec![entry(1, 64), entry(2, 61), entry(3, 20)]
@@ -329,5 +330,77 @@ fn a_new_node_that_also_rates_is_still_rejected_by_liquid_rank() {
             &config_with_initial_reputation(20)
         ),
         Err(PorError::MissingRaterReputation)
+    );
+}
+
+/// Production defaults: scale 1_000_000_000, initial 200_000_000. Node 1 rates
+/// node 2; nobody rates node 1.
+fn production_sparse_ratings() -> Vec<RatingRecord> {
+    vec![RatingRecord::new(
+        ROUND,
+        node(1),
+        node(2),
+        PorConfig::DEFAULT_SCALE,
+        vec![0x01],
+    )]
+}
+
+fn production_previous() -> ReputationVector {
+    ReputationVector {
+        round: ROUND - 1,
+        values: vec![
+            entry(1, PorConfig::DEFAULT_INITIAL_REPUTATION),
+            entry(2, PorConfig::DEFAULT_INITIAL_REPUTATION),
+        ],
+    }
+}
+
+#[test]
+fn carry_forward_does_not_decay_under_clamp_at_production_scale() {
+    let config = PorConfig::default();
+    let replayed = replay_reputation_transition(
+        &production_previous(),
+        &production_sparse_ratings(),
+        ROUND,
+        &config,
+    )
+    .unwrap();
+
+    // Naive clamp of the carried-forward 200_000_000 would yield 196_116_135.
+    assert_eq!(
+        clamp_reputation_value(
+            PorConfig::DEFAULT_INITIAL_REPUTATION,
+            PorConfig::DEFAULT_SCALE
+        )
+        .unwrap(),
+        196_116_135
+    );
+    assert_eq!(
+        replayed.entries[0],
+        entry(1, PorConfig::DEFAULT_INITIAL_REPUTATION)
+    );
+    assert_ne!(
+        replayed.entries[1].reputation,
+        PorConfig::DEFAULT_INITIAL_REPUTATION
+    );
+}
+
+#[test]
+fn neutral_still_clamps_an_unrated_node_at_production_scale() {
+    let config = PorConfig {
+        missing_entry_policy: MissingEntryPolicy::Neutral,
+        ..PorConfig::default()
+    };
+    let replayed = replay_reputation_transition(
+        &production_previous(),
+        &production_sparse_ratings(),
+        ROUND,
+        &config,
+    )
+    .unwrap();
+
+    assert_ne!(
+        replayed.entries[0].reputation,
+        PorConfig::DEFAULT_INITIAL_REPUTATION
     );
 }
