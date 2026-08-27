@@ -161,12 +161,14 @@ pub fn clamp_reputation_vector(
     })
 }
 
-/// Clamp a blended transition, leaving CarryForward entries unchanged.
+/// Clamp a blended transition, restoring CarryForward entries from previous.
 ///
-/// `CarryForward` copies the previous finalized reputation into the blend.
-/// The sigmoid `R / sqrt(1 + R^2)` is not idempotent for `R > 0`, so applying
-/// it again would shrink that value every sparse round — an implicit inactivity
-/// penalty. Those entries are therefore skipped. Rated nodes, newly seeded
+/// `CarryForward` means the finalized reputation is the previous value. The
+/// sigmoid `R / sqrt(1 + R^2)` is not idempotent for `R > 0`, so clamping that
+/// already-finalized value would shrink it every sparse round — an implicit
+/// inactivity penalty. Those entries are therefore taken from
+/// `previous_reputation`, not from `blended`, so a hand-built blended vector
+/// cannot preserve an arbitrary unclamped value. Rated nodes, newly seeded
 /// nodes, and every entry under `Reject` or `Neutral` are still clamped.
 ///
 /// `previous_reputation` and `contribution` must be the same vectors passed to
@@ -197,7 +199,7 @@ pub fn clamp_reputation_transition(
         let in_previous = has_node_at(previous_reputation, previous_index, entry);
         let in_contribution = has_node_at(contribution, contribution_index, entry);
         let reputation = if in_previous && !in_contribution {
-            entry.reputation
+            previous_reputation.values[previous_index].reputation
         } else {
             clamp_reputation_value(entry.reputation, scale)?
         };

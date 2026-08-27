@@ -12,14 +12,16 @@ pub enum MissingEntryPolicy {
     /// Reject the round unless both vectors cover the same node set.
     Reject,
 
-    /// Treat an unrated node's contribution as its previous reputation and skip
-    /// the sigmoid clamp for that node, so its finalized reputation is unchanged.
+    /// Treat an unrated node's contribution as its previous reputation and take
+    /// the finalized value from previous reputation, so it is unchanged.
     ///
     /// Absence of ratings is not evidence of inactivity: a node can be online
     /// and simply not interacted with. Punishing that belongs to the inactivity
     /// penalty stage, which knows the missed-round count. The clamp is skipped
     /// because it is not idempotent: applying it to an already-finalized value
-    /// would decay reputation every sparse round.
+    /// would decay reputation every sparse round. The previous value is copied
+    /// rather than trusting the blended entry, so a hand-built blend cannot
+    /// preserve an arbitrary unclamped value.
     #[default]
     CarryForward,
 
