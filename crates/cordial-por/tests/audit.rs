@@ -260,8 +260,7 @@ fn replays_a_sparse_round_and_carries_the_unrated_node_forward() {
             .unwrap();
 
     // Nodes 1 and 2 move as in the fully rated round; node 3 received no
-    // ratings, so CarryForward copies its previous value and the pipeline
-    // clamp leaves that already-finalized reputation untouched.
+    // ratings, so CarryForward copies its previous finalized reputation.
     assert_eq!(
         replayed.entries,
         vec![entry(1, 64), entry(2, 61), entry(3, 20)]

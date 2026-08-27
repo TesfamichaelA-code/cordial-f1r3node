@@ -177,6 +177,23 @@ fn carry_forward_skips_clamp_for_an_unrated_node() {
 }
 
 #[test]
+fn carry_forward_copies_previous_not_a_hand_built_blend() {
+    let previous = vector(6, vec![entry(1, 200_000_000)]);
+    let contribution = vector(7, Vec::new());
+    let blended = vector(7, vec![entry(1, 999_000_000)]);
+
+    let out = clamp_reputation_transition(
+        &blended,
+        &previous,
+        &contribution,
+        &cfg(MissingEntryPolicy::CarryForward),
+    )
+    .unwrap();
+
+    assert_eq!(out.values, vec![entry(1, 200_000_000)]);
+}
+
+#[test]
 fn carry_forward_still_clamps_a_rated_node() {
     let previous = vector(6, vec![entry(1, 200_000_000)]);
     let contribution = vector(7, vec![entry(1, 400_000_000)]);
