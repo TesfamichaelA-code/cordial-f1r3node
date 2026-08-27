@@ -193,7 +193,7 @@ through `PorConfig::missing_entry_policy` rather than rejecting the round:
 | Policy | Node with no contribution | Node with no previous reputation |
 |--------|---------------------------|----------------------------------|
 | `Reject` | `MissingContributionEntry` | `MissingPreviousReputation` |
-| `CarryForward` (default) | `P_i := R_k_i`, and the sigmoid clamp is skipped for that node so the finalized reputation is unchanged | seeded from `initial_reputation` |
+| `CarryForward` (default) | `P_i := R_k_i`, and the pipeline clamp copies `R_k_i` so the finalized reputation is unchanged | seeded from `initial_reputation` |
 | `Neutral` | `P_i := initial_reputation` | seeded from `initial_reputation` |
 
 Naming the fallback is the point: the earlier strict rejection existed to stop
@@ -211,9 +211,10 @@ The sigmoid clamp is not idempotent. Clamping an already-finalized CarryForward
 value would shrink it every sparse round — at production defaults
 (`scale = 1_000_000_000`, `R = 200_000_000`) that is a drop to `196_116_135`,
 about 1.94% per round, which is an implicit inactivity penalty. The pipeline
-therefore clamps with `clamp_reputation_transition`, which leaves CarryForward
-entries untouched and still clamps rated nodes, newly seeded nodes, and every
-entry under `Reject` or `Neutral`.
+therefore clamps with `clamp_reputation_transition`, which copies the previous
+finalized reputation for CarryForward entries rather than trusting the blended
+value, and still clamps rated nodes, newly seeded nodes, and every entry under
+`Reject` or `Neutral`.
 
 The `src/clamp.rs` module applies the paper sigmoid-style clamp with:
 
@@ -232,8 +233,9 @@ checked arithmetic overflow as `PorError::ClampOverflow`, preserves vector
 round and ordering, and does not mutate `ReputationState`.
 `clamp_reputation_vector` clamps every entry. The audit replay and any other
 full-pipeline caller use `clamp_reputation_transition`, which takes the same
-previous and contribution vectors as the blend so CarryForward entries are not
-clamped a second time.
+previous and contribution vectors as the blend and restores CarryForward
+entries from previous reputation so a hand-built blend cannot preserve an
+arbitrary unclamped value.
 
 The `src/state.rs` module applies a finalized vector with:
 
